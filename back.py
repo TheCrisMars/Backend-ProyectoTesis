@@ -30,6 +30,11 @@ PORT = int(os.getenv("PORT", "5000"))
 
 CORS(app, resources={r"/*": {"origins": "*"}})
 
+
+@app.route("/healthz", methods=["GET"])
+def healthz():
+    return jsonify({"status": "ok"}), 200
+
 # --------------------------------------------------------
 # ESTADOS GLOBALES
 # --------------------------------------------------------
