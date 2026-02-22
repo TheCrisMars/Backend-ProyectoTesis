@@ -201,14 +201,78 @@ def login():
 # --------------------------------------------------------
 # API REST
 # --------------------------------------------------------
-@app.route("/api/status", methods=["GET"])
+@app.route("/api/history", methods=["GET"])
 @token_required
-def api_status():
-    return jsonify({
-        "pulses": estado_pulsos,
-        "sensor": ultimo_sensado,
-        "bomba": estado_bomba_actual
-    })
+def api_history():
+    try:
+        limit = int(request.args.get("limit", 24))
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT humedad_suelo, adc, sensor, origen, finca, created_at
+            FROM sensor_measurements
+            ORDER BY created_at DESC
+            LIMIT %s
+        """, (limit,))
+        rows = cur.fetchall()
+        cur.close()
+        conn.close()
+
+        # Invertir para que el más antiguo esté al principio (para gráficas)
+        rows = list(reversed(rows))
+
+        data = []
+        for row in rows:
+            humedad_suelo, adc, sensor, origen, finca, created_at = row
+            data.append({
+                "time": created_at.strftime("%H:%M") if created_at else "--",
+                "date": created_at.strftime("%d/%m %H:%M") if created_at else "--",
+                "humedad_suelo": humedad_suelo,
+                "adc": adc,
+                "sensor": sensor,
+                "finca": finca
+            })
+
+        return jsonify(data)
+    except Exception as e:
+        print("❌ Error en /api/history:", e)
+        return jsonify({"error": str(e)}), 500
+
+@app.route("/api/sensor", methods=["POST"])
+@token_required
+def api_update_sensor():
+    global ultimo_sensado
+    data = request.get_json()
+    if not data:
+        return jsonify({"error": "Datos requeridos"}), 400
+
+    try:
+        humedad = int(data.get("humedad_suelo"))
+    except (TypeError, ValueError):
+        humedad = None
+
+    ultimo_sensado = {
+        "humedad_suelo": humedad,
+        "adc": data.get("adc"),
+        "sensor": data.get("sensor"),
+        "origen": data.get("origen"),
+        "finca": data.get("finca")
+    }
+
+    broadcast({"type": "nuevo_sensor", "data": ultimo_sensado})
+
+    if humedad is not None and humedad < HUM_MIN:
+        estado_pulsos[4] = "on"
+        broadcast({"type": "pulses", "data": estado_pulsos})
+        enviar_pulse("on", 4)
+
+        threading.Thread(
+            target=apagar_pulse_despues,
+            args=(4, AUTO_DELAY),
+            daemon=True
+        ).start()
+
+    return jsonify({"status": "ok", "data": ultimo_sensado})
 
 @app.route("/api/pulse", methods=["POST"])
 @token_required
