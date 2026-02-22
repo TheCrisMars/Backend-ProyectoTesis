@@ -1,0 +1,9 @@
+flask
+flask-cors
+psycopg2-binary
+python-dotenv
+werkzeug
+pyjwt
+requests
+gevent
+gevent-websocket
