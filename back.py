@@ -24,6 +24,10 @@ app = Flask(__name__)
 app.config["SECRET_KEY"] = os.getenv("SECRET_KEY", "super_secret_key")
 DATABASE_URL = os.getenv("DATABASE_URL")
 
+# Render (y la mayoría de PaaS) inyecta PORT; local puede usar 5000.
+HOST = os.getenv("HOST", "0.0.0.0")
+PORT = int(os.getenv("PORT", "5000"))
+
 CORS(app, resources={r"/*": {"origins": "*"}})
 
 # --------------------------------------------------------
@@ -45,7 +49,7 @@ ultimo_sensado = {
     "finca": None
 }
 
-NODE_RED_URL = "http://20.57.20.144:1880/pulse"
+NODE_RED_URL = os.getenv("NODE_RED_URL", "http://20.57.20.144:1880/pulse")
 AUTO_DELAY = 1
 HUM_MIN = 41
 
@@ -55,6 +59,8 @@ clients = set()
 # BASE DE DATOS
 # --------------------------------------------------------
 def get_db_connection():
+    if not DATABASE_URL:
+        raise RuntimeError("DATABASE_URL no está configurada")
     return psycopg2.connect(DATABASE_URL)
 
 # --------------------------------------------------------
@@ -159,12 +165,18 @@ def login():
     username = data.get("username")
     password = data.get("password")
 
-    conn = get_db_connection()
-    cur = conn.cursor()
-    cur.execute("SELECT * FROM users WHERE username=%s", (username,))
-    user = cur.fetchone()
-    cur.close()
-    conn.close()
+    if not DATABASE_URL:
+        return make_response("Servidor sin base de datos configurada", 500)
+
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("SELECT * FROM users WHERE username=%s", (username,))
+        user = cur.fetchone()
+        cur.close()
+        conn.close()
+    except Exception:
+        return make_response("Error de conexión a la base de datos", 500)
 
     if not user or not check_password_hash(user[2], password):
         return make_response("Credenciales inválidas", 401)
@@ -283,18 +295,21 @@ class PulseWS(WebSocketApplication):
 # MAIN
 # --------------------------------------------------------
 if __name__ == "__main__":
-    threading.Thread(
-        target=guardar_sensor_periodicamente,
-        daemon=True
-    ).start()
+    if DATABASE_URL:
+        threading.Thread(
+            target=guardar_sensor_periodicamente,
+            daemon=True
+        ).start()
+    else:
+        print("⚠️ DATABASE_URL no configurada: sin guardado periódico")
 
     server = WebSocketServer(
-        ("10.10.10.1", 5000),
+        (HOST, PORT),
         Resource([
             ("/ws", PulseWS),
             ("/", app)
         ])
     )
 
-    print("🚀 Backend activo en 10.10.10.1:5000")
+    print(f"🚀 Backend activo en {HOST}:{PORT}")
     server.serve_forever()
