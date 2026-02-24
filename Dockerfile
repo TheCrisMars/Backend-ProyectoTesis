@@ -6,11 +6,6 @@ ENV PYTHONUNBUFFERED=1
 
 WORKDIR /app
 
-# Dependencias del sistema necesarias para psycopg2 y compilación
-RUN apt-get update && apt-get install -y \
-    gcc \
-    libpq-dev \
-    && rm -rf /var/lib/apt/lists/*
 
 # Actualizar pip, wheel y setuptools
 RUN pip install --upgrade pip wheel setuptools

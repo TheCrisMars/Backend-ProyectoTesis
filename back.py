@@ -24,16 +24,7 @@ app = Flask(__name__)
 app.config["SECRET_KEY"] = os.getenv("SECRET_KEY", "super_secret_key")
 DATABASE_URL = os.getenv("DATABASE_URL")
 
-# Render (y la mayoría de PaaS) inyecta PORT; local puede usar 5000.
-HOST = os.getenv("HOST", "0.0.0.0")
-PORT = int(os.getenv("PORT", "5000"))
-
 CORS(app, resources={r"/*": {"origins": "*"}})
-
-
-@app.route("/healthz", methods=["GET"])
-def healthz():
-    return jsonify({"status": "ok"}), 200
 
 # --------------------------------------------------------
 # ESTADOS GLOBALES
@@ -54,7 +45,7 @@ ultimo_sensado = {
     "finca": None
 }
 
-NODE_RED_URL = os.getenv("NODE_RED_URL", "http://20.57.20.144:1880/pulse")
+NODE_RED_URL = "http://20.57.20.144:1880/pulse"
 AUTO_DELAY = 1
 HUM_MIN = 41
 
@@ -64,8 +55,6 @@ clients = set()
 # BASE DE DATOS
 # --------------------------------------------------------
 def get_db_connection():
-    if not DATABASE_URL:
-        raise RuntimeError("DATABASE_URL no está configurada")
     return psycopg2.connect(DATABASE_URL)
 
 # --------------------------------------------------------
@@ -106,21 +95,88 @@ def broadcast(message):
     for ws in dead:
         clients.discard(ws)
 
-def enviar_pulse(accion, pulse):
-    try:
-        requests.post(
-            NODE_RED_URL,
-            json={"accion": accion, "pulse": pulse},
-            timeout=3
-        )
-    except Exception:
-        pass
+NODE_RED_URL = "wss://api.ingeniericast.uk/ws"
 
-def apagar_pulse_despues(pulse, delay):
+def enviar_pulse(accion, pulse, token=None):
+    try:
+        import websocket
+        ws_url = f"{NODE_RED_URL}?token={token}" if token else NODE_RED_URL
+        ws = websocket.create_connection(ws_url, timeout=5)
+        
+        # Formato que espera el servidor WS externo
+        payload = {"accion": accion, "pulse": pulse}
+        ws.send(json.dumps(payload))
+        ws.close()
+        print(f"✅ Pulso enviado a VPS: {payload}")
+    except Exception as e:
+        print(f"⚠️ Error enviando pulso por WS a externa: {e}")
+
+def apagar_pulse_despues(pulse, delay, token=None):
     time.sleep(delay)
     estado_pulsos[pulse] = "off"
-    enviar_pulse("off", pulse)
+    enviar_pulse("off", pulse, token)
     broadcast({"type": "pulses", "data": estado_pulsos})
+
+def escuchar_vps_ws():
+    import websocket
+    def on_message(ws, message):
+        global ultimo_sensado, estado_bomba_actual, estado_pulsos
+        try:
+            data = json.loads(message)
+            msg_type = data.get("type")
+            
+            if msg_type == "pulses":
+                estado_pulsos.update(data.get("data", {}))
+                broadcast({"type": "pulses", "data": estado_pulsos})
+            
+            elif msg_type == "estado_bomba":
+                estado_bomba_actual.update(data.get("data", {}))
+                broadcast({"type": "estado_bomba", "data": estado_bomba_actual})
+                
+            elif msg_type == "update_sensor":
+                d = data.get("data", {})
+                try:
+                    humedad = int(d.get("humedad_suelo"))
+                except:
+                    humedad = None
+
+                ultimo_sensado.update({
+                    "humedad_suelo": humedad,
+                    "adc": d.get("adc"),
+                    "sensor": d.get("sensor"),
+                    "origen": d.get("origen"),
+                    "finca": d.get("finca")
+                })
+                broadcast({"type": "nuevo_sensor", "data": ultimo_sensado})
+                
+            elif msg_type == "estado_entrada":
+                # Convertir estado_entrada de la VPS a estado_bomba para el frontend
+                estado_bomba_actual.update(data.get("data", {}))
+                broadcast({"type": "estado_bomba", "data": estado_bomba_actual})
+                
+        except Exception as e:
+            print("⚠️ Error parseando mensaje de VPS:", e)
+
+    def on_error(ws, error):
+        print("⚠️ VPS WS Error:", error)
+
+    def on_close(ws, close_status_code, close_msg):
+        print("🔴 VPS WS Desconectado. Reconectando en 5s...")
+
+    def on_open(ws):
+        print("🟢 Conectado al WS de la VPS para escuchar eventos")
+
+    while True:
+        try:
+            ws = websocket.WebSocketApp(NODE_RED_URL,
+                                      on_message=on_message,
+                                      on_error=on_error,
+                                      on_close=on_close,
+                                      on_open=on_open)
+            ws.run_forever(ping_interval=10, ping_timeout=5)
+        except:
+            pass
+        time.sleep(5)
 
 # --------------------------------------------------------
 # GUARDAR SENSOR CADA 1 HORA
@@ -170,18 +226,12 @@ def login():
     username = data.get("username")
     password = data.get("password")
 
-    if not DATABASE_URL:
-        return make_response("Servidor sin base de datos configurada", 500)
-
-    try:
-        conn = get_db_connection()
-        cur = conn.cursor()
-        cur.execute("SELECT * FROM users WHERE username=%s", (username,))
-        user = cur.fetchone()
-        cur.close()
-        conn.close()
-    except Exception:
-        return make_response("Error de conexión a la base de datos", 500)
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM users WHERE username=%s", (username,))
+    user = cur.fetchone()
+    cur.close()
+    conn.close()
 
     if not user or not check_password_hash(user[2], password):
         return make_response("Credenciales inválidas", 401)
@@ -201,81 +251,49 @@ def login():
 # --------------------------------------------------------
 # API REST
 # --------------------------------------------------------
+@app.route("/api/status", methods=["GET"])
+@token_required
+def api_status():
+    return jsonify({
+        "pulses": estado_pulsos,
+        "sensor": ultimo_sensado,
+        "bomba": estado_bomba_actual
+    })
+
 @app.route("/api/history", methods=["GET"])
-@token_required
-def api_history():
-    try:
-        limit = int(request.args.get("limit", 24))
-        conn = get_db_connection()
-        cur = conn.cursor()
-        cur.execute("""
-            SELECT humedad_suelo, adc, sensor, origen, finca, created_at
-            FROM sensor_measurements
-            ORDER BY created_at DESC
-            LIMIT %s
-        """, (limit,))
-        rows = cur.fetchall()
-        cur.close()
-        conn.close()
-
-        # Invertir para que el más antiguo esté al principio (para gráficas)
-        rows = list(reversed(rows))
-
-        data = []
-        for row in rows:
-            humedad_suelo, adc, sensor, origen, finca, created_at = row
-            data.append({
-                "time": created_at.strftime("%H:%M") if created_at else "--",
-                "date": created_at.strftime("%d/%m %H:%M") if created_at else "--",
-                "humedad_suelo": humedad_suelo,
-                "adc": adc,
-                "sensor": sensor,
-                "finca": finca
-            })
-
-        return jsonify(data)
-    except Exception as e:
-        print("❌ Error en /api/history:", e)
-        return jsonify({"error": str(e)}), 500
-
-@app.route("/api/sensor", methods=["POST"])
-@token_required
-def api_update_sensor():
-    global ultimo_sensado
-    data = request.get_json()
-    if not data:
-        return jsonify({"error": "Datos requeridos"}), 400
-
-    try:
-        humedad = int(data.get("humedad_suelo"))
-    except (TypeError, ValueError):
-        humedad = None
-
-    ultimo_sensado = {
-        "humedad_suelo": humedad,
-        "adc": data.get("adc"),
-        "sensor": data.get("sensor"),
-        "origen": data.get("origen"),
-        "finca": data.get("finca")
-    }
-
-    broadcast({"type": "nuevo_sensor", "data": ultimo_sensado})
-
-    if humedad is not None and humedad < HUM_MIN:
-        estado_pulsos[4] = "on"
-        broadcast({"type": "pulses", "data": estado_pulsos})
-        enviar_pulse("on", 4)
-
-        threading.Thread(
-            target=apagar_pulse_despues,
-            args=(4, AUTO_DELAY),
-            daemon=True
-        ).start()
-
-    return jsonify({"status": "ok", "data": ultimo_sensado})
+def get_history():
+    limit = request.args.get("limit", default=24, type=int)
+    
+    conn = get_db_connection()
+    cur = conn.cursor()
+    
+    cur.execute("""
+        SELECT created_at, humedad_suelo, adc, sensor, origen, finca 
+        FROM sensor_measurements 
+        ORDER BY created_at DESC 
+        LIMIT %s
+    """, (limit,))
+    
+    rows = cur.fetchall()
+    cur.close()
+    conn.close()
+    
+    history = []
+    for r in rows:
+        ts = r[0]
+        history.append({
+            "time": ts.strftime("%H:%M"),
+            "date": ts.strftime("%Y-%m-%d"),
+            "humedad_suelo": r[1],
+            "adc": r[2],
+            "sensor": r[3],
+            "origen": r[4],
+            "finca": r[5]
+        })
+        
+    return jsonify(history)
 
 @app.route("/api/pulse", methods=["POST"])
-@token_required
 def control_pulse():
     data = request.get_json()
     accion = data.get("accion")
@@ -286,14 +304,13 @@ def control_pulse():
 
     estado_pulsos[pulse] = accion
     broadcast({"type": "pulses", "data": estado_pulsos})
-    enviar_pulse(accion, pulse)
-
-    if accion == "on":
-        threading.Thread(
-            target=apagar_pulse_despues,
-            args=(pulse, AUTO_DELAY),
-            daemon=True
-        ).start()
+    
+    auth_header = request.headers.get("Authorization")
+    token = None
+    if auth_header and auth_header.startswith("Bearer "):
+        token = auth_header.split(" ")[1]
+        
+    enviar_pulse(accion, pulse, token)
 
     return jsonify({"estado": "ok"})
 
@@ -364,21 +381,24 @@ class PulseWS(WebSocketApplication):
 # MAIN
 # --------------------------------------------------------
 if __name__ == "__main__":
-    if DATABASE_URL:
-        threading.Thread(
-            target=guardar_sensor_periodicamente,
-            daemon=True
-        ).start()
-    else:
-        print("⚠️ DATABASE_URL no configurada: sin guardado periódico")
+    threading.Thread(
+        target=escuchar_vps_ws,
+        daemon=True
+    ).start()
 
+    threading.Thread(
+        target=guardar_sensor_periodicamente,
+        daemon=True
+    ).start()
+
+    port = int(os.environ.get("PORT", 5000))
     server = WebSocketServer(
-        (HOST, PORT),
+        ("0.0.0.0", port),
         Resource([
             ("/ws", PulseWS),
             ("/", app)
         ])
     )
 
-    print(f"🚀 Backend activo en {HOST}:{PORT}")
+    print(f"🚀 Backend activo en 0.0.0.0:{port}")
     server.serve_forever()

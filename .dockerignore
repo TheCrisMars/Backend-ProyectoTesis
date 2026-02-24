@@ -1,0 +1,22 @@
+# Git and cache
+.git
+.gitignore
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Environment variables
+.env
+
+# MacOS
+.DS_Store
+
+# IDEs
+.vscode/
+.idea/
+
+# Virtual environments
+venv/
+env/
+.env/

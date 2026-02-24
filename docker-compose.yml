@@ -6,3 +6,5 @@ services:
     container_name: backend-riego
     network_mode: "host"
     restart: unless-stopped
+    volumes:
+      - .:/app
